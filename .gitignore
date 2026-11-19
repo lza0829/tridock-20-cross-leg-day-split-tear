@@ -1,0 +1,14 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# 运行时数据（SQLite 湖）
+data/
+
+# 本地环境
+.env
