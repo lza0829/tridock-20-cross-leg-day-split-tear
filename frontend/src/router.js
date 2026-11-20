@@ -6,6 +6,7 @@ import Confirms from './pages/Confirms.vue'
 import Reconcile from './pages/Reconcile.vue'
 import Settings from './pages/Settings.vue'
 import IngestEvents from './pages/IngestEvents.vue'
+import Quarantine from './pages/Quarantine.vue'
 
 export default createRouter({
   history: createWebHistory(),
@@ -16,6 +17,7 @@ export default createRouter({
     { path: '/confirms', component: Confirms },
     { path: '/reconcile', component: Reconcile },
     { path: '/ingest-events', component: IngestEvents },
+    { path: '/quarantine', component: Quarantine },
     { path: '/settings', component: Settings },
   ],
 })

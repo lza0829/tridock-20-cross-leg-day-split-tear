@@ -1,5 +1,6 @@
 from __future__ import annotations
 from app.db import connect
+from app.services.daykey import DAY_KEY_RULE
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS settings (
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS reconcile_batches (
   status TEXT NOT NULL,
   sealed_at TEXT,
   note TEXT,
-  fold_rule TEXT NOT NULL DEFAULT 'declared_dock_day'
+  fold_rule TEXT NOT NULL DEFAULT 'first_complete_anchor_day'
 );
 CREATE TABLE IF NOT EXISTS match_rows (
   id INTEGER PRIMARY KEY,
@@ -86,6 +87,30 @@ CREATE TABLE IF NOT EXISTS reopen_requests (
   dock_day TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'none'
 );
+CREATE TABLE IF NOT EXISTS day_anchors (
+  id INTEGER PRIMARY KEY,
+  supplier_code TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  anchor_day TEXT NOT NULL,
+  anchor_leg TEXT NOT NULL,
+  anchor_line_no TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(supplier_code, sku)
+);
+CREATE TABLE IF NOT EXISTS quarantine_lines (
+  id INTEGER PRIMARY KEY,
+  leg TEXT NOT NULL,
+  line_no TEXT NOT NULL,
+  supplier_code TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  declared_dock_day TEXT NOT NULL,
+  anchor_day TEXT NOT NULL,
+  qty REAL NOT NULL,
+  occurred_at TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_anchor ON quarantine_lines(anchor_day);
 CREATE TABLE IF NOT EXISTS ingest_events (
   id INTEGER PRIMARY KEY,
   leg TEXT NOT NULL,
@@ -106,9 +131,32 @@ CREATE INDEX IF NOT EXISTS idx_ingest_closed_day ON ingest_events(closed_dock_da
 CREATE INDEX IF NOT EXISTS idx_ingest_result ON ingest_events(result);
 '''
 
-# 已存在库的轻量迁移：补齐快照表（旧库无此表时 SCHEMA 的 IF NOT EXISTS 已覆盖，
-# 这里保留显式迁移点，后续口径升级只在此追加）。
+# 旧库迁移：锚日架构新增表与列。每次口径升级只在此追加。
 MIGRATIONS = [
+    '''CREATE TABLE IF NOT EXISTS day_anchors (
+  id INTEGER PRIMARY KEY,
+  supplier_code TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  anchor_day TEXT NOT NULL,
+  anchor_leg TEXT NOT NULL,
+  anchor_line_no TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(supplier_code, sku)
+)''',
+    '''CREATE TABLE IF NOT EXISTS quarantine_lines (
+  id INTEGER PRIMARY KEY,
+  leg TEXT NOT NULL,
+  line_no TEXT NOT NULL,
+  supplier_code TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  declared_dock_day TEXT NOT NULL,
+  anchor_day TEXT NOT NULL,
+  qty REAL NOT NULL,
+  occurred_at TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL
+)''',
+    "CREATE INDEX IF NOT EXISTS idx_quarantine_anchor ON quarantine_lines(anchor_day)",
     '''CREATE TABLE IF NOT EXISTS ingest_events (
   id INTEGER PRIMARY KEY,
   leg TEXT NOT NULL,
@@ -127,9 +175,44 @@ MIGRATIONS = [
 )''',
     "CREATE INDEX IF NOT EXISTS idx_ingest_closed_day ON ingest_events(closed_dock_day)",
     "CREATE INDEX IF NOT EXISTS idx_ingest_result ON ingest_events(result)",
-    # 旧库补批次口径列；全局架构 A，历史批次同口径
+    # 旧库补批次口径列；历史批次保留旧标识只读，新批次一律首行锚日
     "ALTER TABLE reconcile_batches ADD COLUMN fold_rule TEXT NOT NULL DEFAULT 'declared_dock_day'",
 ]
+
+def _backfill_anchors(conn) -> None:
+    """旧库（架构切换前已有正式行）锚回填：每个业务键取最早完整落库行的 dock_day 立锚。"""
+    anchored = {
+        (r["supplier_code"], r["sku"])
+        for r in conn.execute("SELECT supplier_code, sku FROM day_anchors").fetchall()
+    }
+    legs = [
+        ("expect", "expect_lines", "doc_no", "created_at"),
+        ("receive", "receive_lines", "receive_no", "created_at"),
+        ("confirm", "confirm_lines", "confirm_no", "created_at"),
+    ]
+    keys = set()
+    for _leg, table, _no, _ts in legs:
+        for r in conn.execute(f"SELECT DISTINCT supplier_code, sku FROM {table}").fetchall():
+            keys.add((r["supplier_code"], r["sku"]))
+    for supplier_code, sku in sorted(keys - anchored):
+        earliest = None
+        for leg, table, no_col, ts_col in legs:
+            r = conn.execute(
+                f'''SELECT dock_day, {no_col} AS line_no, {ts_col} AS ts, id FROM {table}
+                    WHERE supplier_code=? AND sku=? ORDER BY {ts_col}, id LIMIT 1''',
+                (supplier_code, sku),
+            ).fetchone()
+            if r and (earliest is None or (r["ts"], r["id"]) < (earliest["ts"], earliest["id"])):
+                row = dict(r)
+                row["leg"] = leg
+                earliest = row
+        if earliest:
+            conn.execute(
+                '''INSERT INTO day_anchors(supplier_code, sku, anchor_day, anchor_leg, anchor_line_no, created_at)
+                   VALUES (?,?,?,?,?,?)''',
+                (supplier_code, sku, earliest["dock_day"], earliest["leg"],
+                 earliest["line_no"], earliest["ts"]),
+            )
 
 def seed_if_empty() -> None:
     conn = connect()
@@ -143,6 +226,7 @@ def seed_if_empty() -> None:
                 if "fold_rule" in existing_cols:
                     continue
             conn.execute(stmt)
+        _backfill_anchors(conn)
         conn.commit()
         if conn.execute("SELECT COUNT(*) c FROM suppliers").fetchone()["c"]:
             return
@@ -159,7 +243,8 @@ def seed_if_empty() -> None:
             ("EX-1002", "SUP-A", "SKU-油-5", "2026-11-18", 20, None),
             ("EX-1003", "SUP-B", "SKU-箱-大", "2026-11-18", 100, None),
             ("EX-1004", "SUP-C", "SKU-巾-卷", "2026-11-18", 60, None),
-            ("EX-0901", "SUP-A", "SKU-米-25", "2026-11-17", 10, "昨日"),
+            # 昨日夹具使用独立货号：同业务键不允许跨日，锚日架构下不能再与当日米-25 同键
+            ("EX-0901", "SUP-A", "SKU-米-10", "2026-11-17", 10, "昨日"),
         ]
         for row in expects:
             conn.execute(
@@ -191,9 +276,21 @@ def seed_if_empty() -> None:
                    VALUES (?,?,?,?,?,?,?)''',
                 (*row, "2026-11-18T12:00:00Z"),
             )
-        # 夹具数据同步补批次快照：正式行与快照同口径（fold_rule=declared_dock_day，零折日）
-        from app.services.daykey import DAY_KEY_RULE
-
+        # 锚表：每个业务键以最先完整落库行（预报腿）的业务日立锚
+        anchors = [
+            ("SUP-A", "SKU-米-25", "2026-11-18", "expect", "EX-1001"),
+            ("SUP-A", "SKU-油-5", "2026-11-18", "expect", "EX-1002"),
+            ("SUP-B", "SKU-箱-大", "2026-11-18", "expect", "EX-1003"),
+            ("SUP-C", "SKU-巾-卷", "2026-11-18", "expect", "EX-1004"),
+            ("SUP-A", "SKU-米-10", "2026-11-17", "expect", "EX-0901"),
+        ]
+        for supplier_code, sku, day, leg, line_no in anchors:
+            conn.execute(
+                '''INSERT INTO day_anchors(supplier_code, sku, anchor_day, anchor_leg, anchor_line_no, created_at)
+                   VALUES (?,?,?,?,?,?)''',
+                (supplier_code, sku, day, leg, line_no, "2026-11-18T08:00:00Z"),
+            )
+        # 装载快照：正式行与快照同口径（首行锚日，种子内零改挂）
         for doc_no, sup, sku, day, qty, _note in expects:
             conn.execute(
                 '''INSERT INTO ingest_events(leg, line_no, supplier_code, sku, declared_dock_day,

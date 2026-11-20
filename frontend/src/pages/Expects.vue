@@ -1,6 +1,6 @@
 <template>
   <div>
-    <div class="hero"><div><h1>预报</h1><p>供应商到货预报清单（本地夹具）。</p></div><button @click="load">刷新</button></div>
+    <div class="hero"><div><h1>预报</h1><p>供应商到货预报清单。同供应商+货号的首条预报通常立锚；后续腿改挂锚日，锚日封印后拒绝写入。</p></div><button @click="load">刷新</button></div>
     <div class="panel">
       <div class="row">
         <input v-model="form.doc_no" placeholder="单号" />
@@ -13,7 +13,7 @@
       <p class="msg">{{ err }}</p>
       <p class="okmsg">{{ ok }}</p>
       <table>
-        <thead><tr><th>单号</th><th>供应商</th><th>货号</th><th>到货日</th><th>数量</th></tr></thead>
+        <thead><tr><th>单号</th><th>供应商</th><th>货号</th><th>锚日闭包</th><th>数量</th></tr></thead>
         <tbody>
           <tr v-for="r in rows" :key="r.id"><td>{{ r.doc_no }}</td><td>{{ r.supplier_code }}</td><td>{{ r.sku }}</td><td>{{ r.dock_day }}</td><td>{{ r.qty }}</td></tr>
         </tbody>
@@ -35,8 +35,8 @@ async function load() {
 async function add() {
   err.value = ''; ok.value = ''
   try {
-    await api('/expects', { method: 'POST', body: JSON.stringify(form.value) })
-    ok.value = '已登记'
+    const res = await api('/expects', { method: 'POST', body: JSON.stringify(form.value) })
+    ok.value = res.folded ? `已改挂至锚日 ${res.anchor_day}` : `已立/落锚日 ${res.anchor_day}`
     await load()
   } catch (e) { err.value = e.message }
 }
